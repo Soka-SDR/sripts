@@ -5,7 +5,7 @@
 
 set -u
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly ESC=$'\033'
 readonly RESET="${ESC}[0m"
 readonly BOLD="${ESC}[1m"
@@ -155,6 +155,43 @@ show_main_menu() {
     frame_end
 }
 
+tool_status() {
+    if have "$1"; then
+        printf 'installed'
+    else
+        printf 'not installed'
+    fi
+}
+
+show_utilities_menu() {
+    frame_start
+    panda_row "$CYAN$BOLD" ' INSTALL SERVER UTILITIES'
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" "[1] sudo      $(tool_status sudo)"
+    panda_row "$WHITE" "[2] tmux      $(tool_status tmux)"
+    panda_row "$WHITE" "[3] ranger    $(tool_status ranger)"
+    panda_row "$WHITE" "[4] btop      $(tool_status btop)"
+    panda_row "$WHITE" "[5] fastfetch $(tool_status fastfetch)"
+    panda_row "$WHITE" ''
+    panda_row "$CYAN" '[B] Back'
+    panda_row "$WHITE" ''
+    panda_row "$DARK_GREY" 'Select one program to install.'
+    panda_row "$DARK_GREY" 'Nothing is installed as a group.'
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    panda_row "$WHITE" ''
+    frame_end
+}
+
 show_ai_menu() {
     frame_start
     panda_row "$CYAN$BOLD" ' AI INSTALLS AND DOWNLOADS'
@@ -288,19 +325,45 @@ install_fastfetch() {
     rm -rf -- "$temp_dir"
 }
 
-install_utilities() {
+install_apt_utility() {
+    local package=$1 command_name=$2
     clear_screen
-    printf '%sServer utility installation%s\n\n' "$CYAN$BOLD" "$RESET"
-    printf 'Packages: sudo, tmux, ranger, btop, fastfetch\n'
-    printf 'Required download tools: curl, ca-certificates, xz-utils\n\n'
-    if confirm 'Install these utilities?'; then
-        run_cmd sudo apt-get update
-        run_cmd sudo apt-get install -y \
-            sudo tmux ranger btop curl ca-certificates xz-utils
-        install_fastfetch
-        printf '\n%sUtility installation finished.%s\n' "$GREEN" "$RESET"
+    printf '%sInstall %s%s\n\n' "$CYAN$BOLD" "$package" "$RESET"
+    if have "$command_name"; then
+        printf '%s%s is already installed.%s\n' "$GREEN" "$package" "$RESET"
+    elif confirm "Install $package?"; then
+        run_cmd sudo apt-get install -y "$package"
     fi
     pause
+}
+
+install_fastfetch_option() {
+    clear_screen
+    printf '%sInstall fastfetch%s\n\n' "$CYAN$BOLD" "$RESET"
+    if have fastfetch; then
+        printf '%sfastfetch is already installed.%s\n' "$GREEN" "$RESET"
+    elif confirm 'Install fastfetch?'; then
+        install_fastfetch
+    fi
+    pause
+}
+
+utilities_menu() {
+    local choice
+    while true; do
+        show_utilities_menu
+        printf '%sSelect: %s' "$BOLD" "$RESET"
+        read -r choice
+        case "${choice,,}" in
+            1) install_apt_utility 'sudo' 'sudo' ;;
+            2) install_apt_utility 'tmux' 'tmux' ;;
+            3) install_apt_utility 'ranger' 'ranger' ;;
+            4) install_apt_utility 'btop' 'btop' ;;
+            5) install_fastfetch_option ;;
+            b) return ;;
+            *) printf '%sUnknown option.%s\n' "$RED" "$RESET"; sleep 1 ;;
+        esac
+    done
 }
 
 download_and_run_installer() {
@@ -647,7 +710,7 @@ main() {
         read -r choice
         case "${choice,,}" in
             1) update_ubuntu ;;
-            2) install_utilities ;;
+            2) utilities_menu ;;
             3) ai_menu ;;
             4) checks_menu ;;
             l) view_log ;;
