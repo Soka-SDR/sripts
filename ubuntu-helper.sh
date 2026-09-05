@@ -5,7 +5,7 @@
 
 set -u
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.2"
 readonly NVIDIA_VERSION="580.178.04"
 readonly NVIDIA_FILE="NVIDIA-Linux-x86_64-${NVIDIA_VERSION}.run"
 readonly NVIDIA_BASE_URL="https://download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_VERSION}"
@@ -45,7 +45,13 @@ clear_screen() {
     [[ -t 1 ]] && printf '\033[H\033[2J\033[3J'
 }
 
+discard_pending_input() {
+    [[ -t 0 ]] || return 0
+    while IFS= read -r -t 0.01; do :; done
+}
+
 pause() {
+    discard_pending_input
     printf '\n%sPress Enter to return...%s' "$DARK_GREY" "$RESET"
     read -r
 }
@@ -56,12 +62,14 @@ nvidia_next() {
     printf '%s%sNEXT STEP:%s %s\n' "$CYAN" "$BOLD" "$RESET" "$1"
     printf '%s%s============================================================%s\n' \
         "$CYAN" "$BOLD" "$RESET"
+    discard_pending_input
     printf '%sPress Enter to return to the NVIDIA menu...%s' "$WHITE$BOLD" "$RESET"
     read -r
 }
 
 confirm() {
     local answer
+    discard_pending_input
     printf '%s%s [y/N]: %s' "$YELLOW" "$1" "$RESET"
     read -r answer
     [[ "$answer" =~ ^[Yy]$ ]]
@@ -75,6 +83,49 @@ run_cmd() {
         printf '%sCommand exited with status %d.%s\n' "$RED" "$rc" "$RESET"
         log "EXIT: $rc"
     fi
+    return "$rc"
+}
+
+run_activity() {
+    local label=$1 output pid rc start pos=0 direction=1 width=22
+    local left right bar
+    shift
+    output=$(mktemp)
+    log "RUN: $*"
+    "$@" >"$output" 2>&1 &
+    pid=$!
+    start=$SECONDS
+    trap 'kill "$pid" 2>/dev/null || true' INT TERM
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf -v left '%*s' "$pos" ''
+        printf -v right '%*s' "$((width - pos - 1))" ''
+        bar="${left// /-}#${right// /-}"
+        printf '\r%s%-28s%s [%s] busy %3ss' \
+            "$CYAN$BOLD" "$label" "$RESET" "$bar" "$((SECONDS - start))"
+        if (( pos >= width - 1 )); then
+            direction=-1
+        elif (( pos <= 0 )); then
+            direction=1
+        fi
+        (( pos += direction ))
+        sleep 0.12
+    done
+
+    wait "$pid"
+    rc=$?
+    trap - INT TERM
+    cat "$output" >>"$LOG_FILE"
+    if (( rc == 0 )); then
+        printf '\r\033[K%s%-28s%s [######################] done\n' \
+            "$GREEN$BOLD" "$label" "$RESET"
+    else
+        printf '\r\033[K%s%-28s%s [######################] FAILED\n' \
+            "$RED$BOLD" "$label" "$RESET"
+        cat "$output"
+        log "EXIT: $rc"
+    fi
+    rm -f -- "$output"
     return "$rc"
 }
 
@@ -487,7 +538,8 @@ nvidia_download() {
     mkdir -p -- "$NVIDIA_DOWNLOAD_DIR"
     if [[ -f "$NVIDIA_RUN_FILE" ]]; then
         printf 'Checking the existing download...\n'
-        if nvidia_checksum "$NVIDIA_RUN_FILE"; then
+        if run_activity 'Verifying NVIDIA download' \
+            nvidia_checksum "$NVIDIA_RUN_FILE"; then
             printf '%sThe existing driver passed NVIDIA SHA-256 verification.%s\n' \
                 "$GREEN" "$RESET"
             printf '%s\n' "$NVIDIA_RUN_FILE"
@@ -504,8 +556,9 @@ nvidia_download() {
     if confirm "Download NVIDIA ${NVIDIA_VERSION} from download.nvidia.com?"; then
         if run_cmd curl -fL --progress-bar \
             "$NVIDIA_BASE_URL/$NVIDIA_FILE" -o "$NVIDIA_RUN_FILE"; then
-            printf '\nVerifying NVIDIA SHA-256 checksum...\n'
-            if nvidia_checksum "$NVIDIA_RUN_FILE"; then
+            printf '\n'
+            if run_activity 'Verifying NVIDIA download' \
+                nvidia_checksum "$NVIDIA_RUN_FILE"; then
                 chmod 600 -- "$NVIDIA_RUN_FILE"
                 printf '%sVerified driver saved to:%s\n%s\n' \
                     "$GREEN" "$RESET" "$NVIDIA_RUN_FILE"
@@ -552,11 +605,18 @@ nvidia_disable_nouveau() {
     printf 'the initramfs. A reboot is required afterward.\n\n'
     printf 'Do not use this step if another GPU depends on Nouveau.\n\n'
     if confirm 'Disable Nouveau and rebuild initramfs?'; then
+        if ! sudo -v; then
+            printf '%sSudo authentication failed. Nothing was changed.%s\n' \
+                "$RED" "$RESET"
+            pause
+            return
+        fi
         printf '%s\n' \
             'blacklist nouveau' \
             'options nouveau modeset=0' |
             sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
-        if run_cmd sudo update-initramfs -u; then
+        printf '\n'
+        if run_activity 'Rebuilding initramfs' sudo update-initramfs -u; then
             printf '\n%sSTEP 3 COMPLETE: Nouveau is disabled for the next boot.%s\n' \
                 "$GREEN" "$RESET"
             log 'Disabled Nouveau and rebuilt initramfs'
@@ -590,8 +650,8 @@ nvidia_install() {
         nvidia_next 'Select [2] to download and verify the driver.'
         return
     fi
-    printf 'Verifying the download...\n'
-    if ! nvidia_checksum "$NVIDIA_RUN_FILE"; then
+    if ! run_activity 'Verifying NVIDIA download' \
+        nvidia_checksum "$NVIDIA_RUN_FILE"; then
         printf '%sInstallation stopped: SHA-256 verification failed.%s\n' "$RED" "$RESET"
         pause
         return
