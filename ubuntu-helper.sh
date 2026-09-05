@@ -5,7 +5,7 @@
 
 set -u
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly NVIDIA_VERSION="580.178.04"
 readonly NVIDIA_FILE="NVIDIA-Linux-x86_64-${NVIDIA_VERSION}.run"
 readonly NVIDIA_BASE_URL="https://download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_VERSION}"
@@ -47,6 +47,16 @@ clear_screen() {
 
 pause() {
     printf '\n%sPress Enter to return...%s' "$DARK_GREY" "$RESET"
+    read -r
+}
+
+nvidia_next() {
+    printf '\n%s%s============================================================%s\n' \
+        "$CYAN" "$BOLD" "$RESET"
+    printf '%s%sNEXT STEP:%s %s\n' "$CYAN" "$BOLD" "$RESET" "$1"
+    printf '%s%s============================================================%s\n' \
+        "$CYAN" "$BOLD" "$RESET"
+    printf '%sPress Enter to return to the NVIDIA menu...%s' "$WHITE$BOLD" "$RESET"
     read -r
 }
 
@@ -165,21 +175,21 @@ show_nvidia_menu() {
     frame_start
     panda_row "$CYAN$BOLD" ' NVIDIA MX130 / 580 LEGACY'
     panda_row "$WHITE" ''
-    panda_row "$WHITE" '[1] Detect GPU and driver'
-    panda_row "$WHITE" '[2] Download official driver'
-    panda_row "$WHITE" '[3] Install build requirements'
-    panda_row "$WHITE" '[4] Disable Nouveau + initramfs'
-    panda_row "$WHITE" '[5] Run NVIDIA installer'
-    panda_row "$WHITE" '[6] Verify NVIDIA driver'
+    panda_row "$WHITE" '[1] Check status (optional)'
+    panda_row "$WHITE" '[2] STEP 1: Download driver'
+    panda_row "$WHITE" '[3] STEP 2: Build requirements'
+    panda_row "$WHITE" '[4] STEP 3: Disable Nouveau'
+    panda_row "$WHITE" '[5] STEP 4: Install driver'
+    panda_row "$WHITE" '[6] STEP 5: Verify driver'
     panda_row "$WHITE" ''
     panda_row "$CYAN" '[B] Back'
     panda_row "$WHITE" ''
     panda_row "$YELLOW" "NVIDIA Linux ${NVIDIA_VERSION}"
     panda_row "$DARK_GREY" 'Official NVIDIA .run package'
-    panda_row "$DARK_GREY" 'x86_64 only; no automatic reboot'
-    panda_row "$DARK_GREY" 'Use the numbered steps in order.'
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
+    panda_row "$YELLOW" 'ORDER: 2 > 3 > 4 > REBOOT'
+    panda_row "$YELLOW" '       5 > REBOOT > 6'
+    panda_row "$DARK_GREY" 'Each screen tells you what is next.'
+    panda_row "$DARK_GREY" 'Reboots always require approval.'
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
@@ -481,7 +491,7 @@ nvidia_download() {
             printf '%sThe existing driver passed NVIDIA SHA-256 verification.%s\n' \
                 "$GREEN" "$RESET"
             printf '%s\n' "$NVIDIA_RUN_FILE"
-            pause
+            nvidia_next 'Select [3] to install the build requirements.'
             return
         fi
         bad_file="$NVIDIA_RUN_FILE.bad-$(date '+%Y%m%d-%H%M%S')"
@@ -500,6 +510,8 @@ nvidia_download() {
                 printf '%sVerified driver saved to:%s\n%s\n' \
                     "$GREEN" "$RESET" "$NVIDIA_RUN_FILE"
                 log "Downloaded and verified NVIDIA $NVIDIA_VERSION"
+                nvidia_next 'Select [3] to install the build requirements.'
+                return
             else
                 printf '%sChecksum verification failed. Do not install this file.%s\n' \
                     "$RED" "$RESET"
@@ -516,10 +528,17 @@ nvidia_requirements() {
     printf 'This installs the compiler, DKMS, current kernel headers,\n'
     printf 'PCI tools, Secure Boot tools, and GLVND development files.\n\n'
     if confirm 'Install NVIDIA build requirements?'; then
-        run_cmd sudo apt-get update &&
+        if run_cmd sudo apt-get update &&
             run_cmd sudo apt-get install -y build-essential dkms \
                 "linux-headers-$(uname -r)" pkg-config libglvnd-dev \
-                mokutil pciutils curl ca-certificates
+                mokutil pciutils curl ca-certificates; then
+            printf '\n%sBuild requirements installed successfully.%s\n' "$GREEN" "$RESET"
+            nvidia_next 'Select [4] to disable Nouveau and rebuild initramfs.'
+            return
+        else
+            printf '\n%sRequirements failed to install. Do not continue to step 4.%s\n' \
+                "$RED" "$RESET"
+        fi
     fi
     pause
 }
@@ -538,10 +557,19 @@ nvidia_disable_nouveau() {
             'options nouveau modeset=0' |
             sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
         if run_cmd sudo update-initramfs -u; then
-            printf '\n%sPreparation complete. Reboot, then return to option 5.%s\n' \
+            printf '\n%sSTEP 3 COMPLETE: Nouveau is disabled for the next boot.%s\n' \
                 "$GREEN" "$RESET"
-            printf 'Reboot manually with: %ssudo reboot%s\n' "$YELLOW" "$RESET"
             log 'Disabled Nouveau and rebuilt initramfs'
+            printf '\n%sA REBOOT IS NOW REQUIRED BEFORE STEP 4.%s\n' \
+                "$YELLOW$BOLD" "$RESET"
+            if confirm 'Reboot the server now?'; then
+                printf 'Rebooting. Reconnect, launch this helper, then select NVIDIA [5].\n'
+                sleep 2
+                sudo reboot
+                return
+            fi
+            nvidia_next 'Exit the helper, run sudo reboot, then select NVIDIA option [5].'
+            return
         fi
     fi
     pause
@@ -559,7 +587,7 @@ nvidia_install() {
     fi
     if [[ ! -f "$NVIDIA_RUN_FILE" ]]; then
         printf '%sDriver file not found. Use download option 2 first.%s\n' "$RED" "$RESET"
-        pause
+        nvidia_next 'Select [2] to download and verify the driver.'
         return
     fi
     printf 'Verifying the download...\n'
@@ -572,21 +600,21 @@ nvidia_install() {
         printf '%sInstallation stopped because Secure Boot is enabled.%s\n' \
             "$RED" "$RESET"
         printf 'Disable Secure Boot in firmware, or use Ubuntu signed packages.\n'
-        pause
+        nvidia_next 'Disable Secure Boot in firmware, then select [5] again.'
         return
     fi
     if lsmod | awk '$1 == "nouveau" { found=1 } END { exit !found }'; then
         printf '%sInstallation stopped because Nouveau is still loaded.%s\n' \
             "$RED" "$RESET"
         printf 'Run option 4, reboot, and try again.\n'
-        pause
+        nvidia_next 'Select [4], complete it, and reboot before selecting [5] again.'
         return
     fi
     if systemctl is-active --quiet display-manager 2>/dev/null; then
         printf '%sInstallation stopped: a graphical display manager is active.%s\n' \
             "$RED" "$RESET"
         printf 'Stop the graphical session before running the installer.\n'
-        pause
+        nvidia_next 'Stop the graphical session, then select [5] again.'
         return
     fi
 
@@ -602,9 +630,25 @@ nvidia_install() {
     printf 'DKMS will be requested for future kernel-module rebuilds.\n\n'
     if confirm "Run the NVIDIA ${NVIDIA_VERSION} installer now?"; then
         chmod 700 -- "$NVIDIA_RUN_FILE"
-        run_cmd sudo sh "$NVIDIA_RUN_FILE" --dkms
-        printf '\nIf installation succeeded, reboot before using the GPU.\n'
-        log "Ran NVIDIA $NVIDIA_VERSION installer"
+        if run_cmd sudo sh "$NVIDIA_RUN_FILE" --dkms; then
+            printf '\n%sSTEP 4 COMPLETE: NVIDIA reports a successful installation.%s\n' \
+                "$GREEN" "$RESET"
+            log "Installed NVIDIA $NVIDIA_VERSION"
+            printf '\n%sA REBOOT IS NOW REQUIRED BEFORE VERIFICATION.%s\n' \
+                "$YELLOW$BOLD" "$RESET"
+            if confirm 'Reboot the server now?'; then
+                printf 'Rebooting. Reconnect, launch this helper, then select NVIDIA [6].\n'
+                sleep 2
+                sudo reboot
+                return
+            fi
+            nvidia_next 'Exit the helper, run sudo reboot, then select NVIDIA option [6].'
+            return
+        else
+            printf '\n%sInstallation failed. Do not reboot merely to continue.%s\n' \
+                "$RED" "$RESET"
+            printf 'Review the error shown above and the current run log.\n'
+        fi
     fi
     pause
 }
@@ -613,7 +657,13 @@ nvidia_verify() {
     clear_screen
     printf '%sVerify NVIDIA driver%s\n\n' "$CYAN$BOLD" "$RESET"
     if have nvidia-smi; then
-        run_cmd nvidia-smi
+        if run_cmd nvidia-smi; then
+            printf '\n%sSUCCESS: the NVIDIA driver is active and responding.%s\n' \
+                "$GREEN$BOLD" "$RESET"
+        else
+            printf '\n%sVerification failed. The driver is not working correctly.%s\n' \
+                "$RED" "$RESET"
+        fi
     else
         printf '%snvidia-smi was not found.%s\n' "$RED" "$RESET"
     fi
@@ -623,7 +673,10 @@ nvidia_verify() {
     else
         printf 'The NVIDIA kernel module is not available.\n'
     fi
-    pause
+    printf '\n%sIf nvidia-smi succeeded, the NVIDIA workflow is finished.%s\n' \
+        "$CYAN$BOLD" "$RESET"
+    printf '%sPress Enter to return to the NVIDIA menu...%s' "$WHITE$BOLD" "$RESET"
+    read -r
 }
 
 nvidia_menu() {
