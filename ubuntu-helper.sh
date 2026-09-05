@@ -5,12 +5,7 @@
 
 set -u
 
-readonly VERSION="1.2.2"
-readonly NVIDIA_VERSION="580.178.04"
-readonly NVIDIA_FILE="NVIDIA-Linux-x86_64-${NVIDIA_VERSION}.run"
-readonly NVIDIA_BASE_URL="https://download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_VERSION}"
-readonly NVIDIA_DOWNLOAD_DIR="$HOME/nvidia-drivers"
-readonly NVIDIA_RUN_FILE="$NVIDIA_DOWNLOAD_DIR/$NVIDIA_FILE"
+readonly VERSION="1.3.1"
 readonly ESC=$'\033'
 readonly RESET="${ESC}[0m"
 readonly BOLD="${ESC}[1m"
@@ -27,8 +22,7 @@ LOG_FILE=""
 
 init_log() {
     mkdir -p -- "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S').log"
-    : > "$LOG_FILE"
+    LOG_FILE=$(mktemp "$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S')-XXXXXX.log") || return 1
     printf 'Panda Ubuntu Helper %s started %s\n' \
         "$VERSION" "$(date --iso-8601=seconds)" >> "$LOG_FILE"
 }
@@ -56,17 +50,6 @@ pause() {
     read -r
 }
 
-nvidia_next() {
-    printf '\n%s%s============================================================%s\n' \
-        "$CYAN" "$BOLD" "$RESET"
-    printf '%s%sNEXT STEP:%s %s\n' "$CYAN" "$BOLD" "$RESET" "$1"
-    printf '%s%s============================================================%s\n' \
-        "$CYAN" "$BOLD" "$RESET"
-    discard_pending_input
-    printf '%sPress Enter to return to the NVIDIA menu...%s' "$WHITE$BOLD" "$RESET"
-    read -r
-}
-
 confirm() {
     local answer
     discard_pending_input
@@ -76,32 +59,46 @@ confirm() {
 }
 
 run_cmd() {
-    log "RUN: $*"
-    "$@" 2>&1 | tee -a "$LOG_FILE"
-    local rc=${PIPESTATUS[0]}
-    if (( rc != 0 )); then
-        printf '%sCommand exited with status %d.%s\n' "$RED" "$rc" "$RESET"
-        log "EXIT: $rc"
-    fi
-    return "$rc"
+    case "$*" in
+        *apt-get*|bash\ *|hermes\ *) run_interactive "$@" ;;
+        *) run_activity "$1" "$@" ;;
+    esac
 }
 
-run_activity() {
+run_activity() (
     local label=$1 output pid rc start pos=0 direction=1 width=22
     local left right bar
     shift
-    output=$(mktemp)
+    if [[ ${1:-} == sudo ]]; then
+        sudo -v || return 1
+        shift
+        set -- sudo -n "$@"
+    fi
+    output=$(mktemp) || return 1
+    pid=''
+    cleanup_activity() {
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+        [[ ! -t 1 ]] || printf '\r\033[K'
+        cat "$output" >> "$LOG_FILE"
+        rm -f -- "$output"
+    }
+    trap cleanup_activity EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     log "RUN: $*"
-    "$@" >"$output" 2>&1 &
+    "$@" </dev/null >"$output" 2>&1 &
     pid=$!
     start=$SECONDS
-    trap 'kill "$pid" 2>/dev/null || true' INT TERM
+    [[ -t 1 ]] || printf '%s: running...\n' "$label"
 
     while kill -0 "$pid" 2>/dev/null; do
         printf -v left '%*s' "$pos" ''
         printf -v right '%*s' "$((width - pos - 1))" ''
         bar="${left// /-}#${right// /-}"
-        printf '\r%s%-28s%s [%s] busy %3ss' \
+        [[ ! -t 1 ]] || printf '\r%s%-28.28s%s [%s] busy %3ss' \
             "$CYAN$BOLD" "$label" "$RESET" "$bar" "$((SECONDS - start))"
         if (( pos >= width - 1 )); then
             direction=-1
@@ -114,19 +111,137 @@ run_activity() {
 
     wait "$pid"
     rc=$?
-    trap - INT TERM
-    cat "$output" >>"$LOG_FILE"
+    pid=''
+    [[ ! -t 1 ]] || printf '\r\033[K'
     if (( rc == 0 )); then
-        printf '\r\033[K%s%-28s%s [######################] done\n' \
+        printf '%s%-28s%s done\n' \
             "$GREEN$BOLD" "$label" "$RESET"
     else
-        printf '\r\033[K%s%-28s%s [######################] FAILED\n' \
+        printf '%s%-28s%s FAILED\n' \
             "$RED$BOLD" "$label" "$RESET"
-        cat "$output"
         log "EXIT: $rc"
     fi
-    rm -f -- "$output"
+    cat "$output"
     return "$rc"
+)
+
+# Interactive programs retain real stdin/stdout. No pipe and no background
+# installer: only a title animation runs in the background.
+run_interactive() (
+    local animator rc start=$SECONDS parent=$BASHPID
+    log "RUN (interactive, output not captured): $*"
+    printf '\nRUNNING: %s\nLive prompts below; animation in tmux status / terminal title.\n' "$1"
+    (
+        trap 'exit 0' INT TERM
+        i=0
+        while kill -0 "$parent" 2>/dev/null; do
+            case $((i % 4)) in
+                0) frame='|' ;; 1) frame='/' ;; 2) frame='-' ;; 3) frame='\' ;;
+            esac
+            if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] && have tmux; then
+                tmux display-message -t "$TMUX_PANE" -d 400 \
+                    "Ubuntu Helper [$frame] running $((SECONDS - start))s" 2>/dev/null || true
+            elif [[ -t 1 ]]; then
+                printf '\033]2;Ubuntu Helper [%s] running %ss\007' \
+                    "$frame" "$((SECONDS - start))"
+            fi
+            i=$((i + 1))
+            sleep 0.2
+        done
+    ) &
+    animator=$!
+    cleanup_interactive() {
+        kill "$animator" 2>/dev/null || true
+        wait "$animator" 2>/dev/null || true
+        [[ ! -t 1 ]] || printf '\033]2;Ubuntu Helper\007'
+    }
+    trap cleanup_interactive EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$@"
+    rc=$?
+    cleanup_interactive
+    trap - EXIT
+    printf '\n%s finished (exit %s).\n' "$1" "$rc"
+    log "EXIT: $rc"
+    return "$rc"
+)
+
+networkd_state() {
+    NETWORKD_LOAD=$(systemctl show -p LoadState --value systemd-networkd.service 2>/dev/null)
+    NETWORKD_ACTIVE=$(systemctl is-active systemd-networkd.service 2>/dev/null) || true
+    NETWORKD_UNIT=$(systemctl is-enabled systemd-networkd.service 2>/dev/null) || true
+}
+
+toggle_networkd() {
+    networkd_state
+    if [[ "$NETWORKD_LOAD" != loaded && "$NETWORKD_LOAD" != masked ]]; then
+        printf 'systemd-networkd.service is unavailable. No change made.\n'
+        return 1
+    fi
+    if [[ "$NETWORKD_ACTIVE" == active || "$NETWORKD_ACTIVE" == activating ]]; then
+        printf '\nThis stops and masks networkd for Wi-Fi AND Ethernet.\n'
+        printf 'It does not turn off the radio or guarantee disconnection.\n'
+        printf 'Network access, including SSH, may be affected. Use a local console.\n'
+        confirm 'Stop and mask systemd-networkd now?' || return 0
+        # A single request applies the mask then stops the service, preventing
+        # activation races. Other services and enablement are left unchanged.
+        run_cmd sudo systemctl mask --now systemd-networkd.service || return
+    else
+        confirm 'Unmask and start systemd-networkd now?' || return 0
+        run_cmd sudo systemctl unmask systemd-networkd.service || return
+        run_cmd sudo systemctl start systemd-networkd.service || return
+    fi
+    networkd_state
+    printf '\nResult: service=%s; startup=%s\n' "$NETWORKD_ACTIVE" "$NETWORKD_UNIT"
+    printf 'Service status is not proof of Wi-Fi connectivity.\n'
+}
+
+network_menu() {
+    local choice device iface state found
+    while true; do
+        networkd_state
+        frame_start
+        panda_row "$CYAN$BOLD" ' WI-FI / NETWORK SERVICE'
+        panda_row "$WHITE" 'systemd-networkd.service'
+        panda_row "$YELLOW" "Service: $NETWORKD_ACTIVE"
+        panda_row "$YELLOW" "Startup: $NETWORKD_UNIT"
+        panda_row "$WHITE" ''
+        found=0
+        for device in /sys/class/net/*/wireless; do
+            [[ -d "$device" ]] || continue
+            iface=$(basename "$(dirname "$device")")
+            state=$(<"/sys/class/net/$iface/operstate")
+            panda_row "$WHITE" "$iface: $state"
+            found=1
+        done
+        (( found )) || panda_row "$YELLOW" 'No Wi-Fi interface detected'
+        panda_row "$WHITE" ''
+        if [[ "$NETWORKD_ACTIVE" == active || "$NETWORKD_ACTIVE" == activating ]]; then
+            panda_row "$WHITE" '[T] Stop + mask service'
+        else
+            panda_row "$WHITE" '[T] Unmask + start service'
+        fi
+        panda_row "$WHITE" '[S] Interface / IP / DNS status'
+        panda_row "$WHITE" '[R] Refresh status'
+        panda_row "$CYAN" '[B] Back'
+        panda_row "$WHITE" ''
+        panda_row "$YELLOW" 'Controls Wi-Fi AND Ethernet'
+        panda_row "$DARK_GREY" 'Service state is not radio state.'
+        panda_row "$DARK_GREY" 'Stopping may leave links online.'
+        panda_row "$DARK_GREY" 'Masked = service cannot start.'
+        panda_row "$DARK_GREY" 'No other services are changed.'
+        frame_end
+        printf '%sSelect: %s' "$BOLD" "$RESET"
+        read -r choice || return
+        case "$choice" in
+            t|T) toggle_networkd; pause ;;
+            s|S) network_status ;;
+            r|R) ;;
+            b|B) return ;;
+            *) printf 'Unknown option.\n' ;;
+        esac
+    done
 }
 
 panda_top() {
@@ -198,14 +313,16 @@ show_main_menu() {
     panda_row "$WHITE" ''
     panda_row "$WHITE" '[1] Update and upgrade Ubuntu'
     panda_row "$WHITE" '[2] Install server utilities'
-    panda_row "$WHITE" '[3] NVIDIA MX130 legacy driver'
+    panda_row "$WHITE" '[3] Wi-Fi / network toggle'
     panda_row "$WHITE" '[4] AI installs and models'
     panda_row "$WHITE" '[5] System check menus'
     panda_row "$WHITE" ''
     panda_row "$CYAN" '[L] View current log'
     panda_row "$RED" '[Q] Quit'
     panda_row "$WHITE" ''
-    panda_row "$DARK_GREY" 'Ubuntu Server setup and checks'
+    networkd_state
+    panda_row "$YELLOW" "Networkd: $NETWORKD_ACTIVE"
+    panda_row "$YELLOW" "Startup: $NETWORKD_UNIT"
     panda_row "$DARK_GREY" 'Use a normal sudo-enabled account'
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
@@ -214,33 +331,6 @@ show_main_menu() {
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" ''
-    frame_end
-}
-
-show_nvidia_menu() {
-    frame_start
-    panda_row "$CYAN$BOLD" ' NVIDIA MX130 / 580 LEGACY'
-    panda_row "$WHITE" ''
-    panda_row "$WHITE" '[1] Check status (optional)'
-    panda_row "$WHITE" '[2] STEP 1: Download driver'
-    panda_row "$WHITE" '[3] STEP 2: Build requirements'
-    panda_row "$WHITE" '[4] STEP 3: Disable Nouveau'
-    panda_row "$WHITE" '[5] STEP 4: Install driver'
-    panda_row "$WHITE" '[6] STEP 5: Verify driver'
-    panda_row "$WHITE" ''
-    panda_row "$CYAN" '[B] Back'
-    panda_row "$WHITE" ''
-    panda_row "$YELLOW" "NVIDIA Linux ${NVIDIA_VERSION}"
-    panda_row "$DARK_GREY" 'Official NVIDIA .run package'
-    panda_row "$YELLOW" 'ORDER: 2 > 3 > 4 > REBOOT'
-    panda_row "$YELLOW" '       5 > REBOOT > 6'
-    panda_row "$DARK_GREY" 'Each screen tells you what is next.'
-    panda_row "$DARK_GREY" 'Reboots always require approval.'
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
     panda_row "$WHITE" ''
@@ -322,17 +412,17 @@ show_qwen_menu() {
     panda_row "$CYAN$BOLD" ' QWEN MODEL DOWNLOADS'
     panda_row "$YELLOW" "Server RAM: $ram"
     panda_row "$WHITE" ''
-    panda_row "$WHITE" '[1] qwen3:0.6b'
-    panda_row "$WHITE" '[2] qwen3:1.7b'
-    panda_row "$WHITE" '[3] qwen3:4b'
-    panda_row "$WHITE" '[4] qwen3:8b'
-    panda_row "$WHITE" '[5] qwen3:14b'
-    panda_row "$WHITE" '[6] qwen3:30b-a3b'
-    panda_row "$WHITE" '[7] qwen3.5:27b'
+    panda_row "$YELLOW" '[1] qwen2.5-coder:3b'
+    panda_row "$DARK_GREY" '    Coding model'
+    panda_row "$WHITE" '[2] qwen3:0.6b'
+    panda_row "$WHITE" '[3] qwen3:1.7b'
+    panda_row "$WHITE" '[4] qwen3.5:0.8b'
+    panda_row "$WHITE" ''
+    panda_row "$DARK_GREY" 'Lightweight models only.'
     panda_row "$WHITE" ''
     panda_row "$CYAN" '[B] Back'
     panda_row "$WHITE" ''
-    panda_row "$DARK_GREY" 'Smaller models need fewer resources.'
+    panda_row "$DARK_GREY" 'Runtime RAM exceeds download size.'
     panda_row "$DARK_GREY" 'A download can be removed later with:'
     panda_row "$DARK_GREY" 'ollama rm MODEL_NAME'
     panda_row "$WHITE" ''
@@ -379,9 +469,10 @@ update_ubuntu() {
     clear_screen
     printf '%sUbuntu update and upgrade%s\n\n' "$CYAN$BOLD" "$RESET"
     if confirm 'Run apt update and apt upgrade -y?'; then
-        run_cmd sudo apt-get update
-        run_cmd sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+        if run_cmd sudo apt-get update &&
+           run_cmd sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
         printf '\n%sUbuntu update completed.%s\n' "$GREEN" "$RESET"
+        fi
     fi
     pause
 }
@@ -454,304 +545,6 @@ utilities_menu() {
             3) install_apt_utility 'ranger' 'ranger' ;;
             4) install_apt_utility 'btop' 'btop' ;;
             5) install_fastfetch_option ;;
-            b) return ;;
-            *) printf '%sUnknown option.%s\n' "$RED" "$RESET"; sleep 1 ;;
-        esac
-    done
-}
-
-nvidia_detect() {
-    clear_screen
-    printf '%sNVIDIA GPU and driver detection%s\n\n' "$CYAN$BOLD" "$RESET"
-
-    if [[ $(uname -m) != x86_64 ]]; then
-        printf '%sUnsupported architecture: %s%s\n' "$RED" "$(uname -m)" "$RESET"
-        printf 'The selected NVIDIA package is for x86_64 systems only.\n'
-    fi
-
-    if have lspci; then
-        printf '%sDetected display hardware%s\n' "$YELLOW" "$RESET"
-        lspci -nnk | awk '
-            BEGIN { IGNORECASE=1 }
-            /VGA compatible controller|3D controller|Display controller/ { show=1; lines=0 }
-            show { print; lines++ }
-            show && lines >= 4 { show=0 }
-        '
-    else
-        printf '%slspci is unavailable. Install the build requirements first.%s\n' \
-            "$YELLOW" "$RESET"
-    fi
-
-    printf '\n%sLoaded graphics modules%s\n' "$YELLOW" "$RESET"
-    if ! lsmod | awk '$1 == "nvidia" || $1 == "nouveau" { found=1; print } END { exit !found }'; then
-        printf 'Neither nvidia nor nouveau is currently loaded.\n'
-    fi
-
-    printf '\n%sInstalled NVIDIA driver%s\n' "$YELLOW" "$RESET"
-    if have nvidia-smi; then
-        nvidia-smi
-    else
-        printf 'nvidia-smi is not installed.\n'
-    fi
-
-    if have mokutil; then
-        printf '\n%sSecure Boot%s\n' "$YELLOW" "$RESET"
-        mokutil --sb-state 2>/dev/null || true
-    fi
-    log 'Ran NVIDIA hardware and driver detection'
-    pause
-}
-
-nvidia_checksum() {
-    local file=$1 checksum_file expected actual
-    checksum_file=$(mktemp)
-    if ! curl -fsSL "$NVIDIA_BASE_URL/$NVIDIA_FILE.sha256sum" -o "$checksum_file"; then
-        rm -f -- "$checksum_file"
-        return 1
-    fi
-    expected=$(awk 'NR == 1 { print $1 }' "$checksum_file")
-    rm -f -- "$checksum_file"
-    [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    actual=$(sha256sum "$file" | awk '{ print $1 }')
-    [[ ${actual,,} == ${expected,,} ]]
-}
-
-nvidia_download() {
-    local bad_file
-    clear_screen
-    printf '%sDownload NVIDIA legacy driver%s\n\n' "$CYAN$BOLD" "$RESET"
-    printf 'Version: %s\n' "$NVIDIA_VERSION"
-    printf 'GPU family: GeForce MX130\n'
-    printf 'Official URL:\n%s/%s\n\n' "$NVIDIA_BASE_URL" "$NVIDIA_FILE"
-
-    if [[ $(uname -m) != x86_64 ]]; then
-        printf '%sDownload stopped: this package requires x86_64.%s\n' "$RED" "$RESET"
-        pause
-        return
-    fi
-    if ! have curl || ! have sha256sum; then
-        printf '%sInstall curl and coreutils before downloading.%s\n' "$RED" "$RESET"
-        pause
-        return
-    fi
-
-    mkdir -p -- "$NVIDIA_DOWNLOAD_DIR"
-    if [[ -f "$NVIDIA_RUN_FILE" ]]; then
-        printf 'Checking the existing download...\n'
-        if run_activity 'Verifying NVIDIA download' \
-            nvidia_checksum "$NVIDIA_RUN_FILE"; then
-            printf '%sThe existing driver passed NVIDIA SHA-256 verification.%s\n' \
-                "$GREEN" "$RESET"
-            printf '%s\n' "$NVIDIA_RUN_FILE"
-            nvidia_next 'Select [3] to install the build requirements.'
-            return
-        fi
-        bad_file="$NVIDIA_RUN_FILE.bad-$(date '+%Y%m%d-%H%M%S')"
-        mv -- "$NVIDIA_RUN_FILE" "$bad_file"
-        printf '%sExisting invalid file preserved as:%s\n%s\n\n' \
-            "$YELLOW" "$RESET" "$bad_file"
-    fi
-
-    printf 'Approximate download size: 379 MB.\n'
-    if confirm "Download NVIDIA ${NVIDIA_VERSION} from download.nvidia.com?"; then
-        if run_cmd curl -fL --progress-bar \
-            "$NVIDIA_BASE_URL/$NVIDIA_FILE" -o "$NVIDIA_RUN_FILE"; then
-            printf '\n'
-            if run_activity 'Verifying NVIDIA download' \
-                nvidia_checksum "$NVIDIA_RUN_FILE"; then
-                chmod 600 -- "$NVIDIA_RUN_FILE"
-                printf '%sVerified driver saved to:%s\n%s\n' \
-                    "$GREEN" "$RESET" "$NVIDIA_RUN_FILE"
-                log "Downloaded and verified NVIDIA $NVIDIA_VERSION"
-                nvidia_next 'Select [3] to install the build requirements.'
-                return
-            else
-                printf '%sChecksum verification failed. Do not install this file.%s\n' \
-                    "$RED" "$RESET"
-                log "NVIDIA $NVIDIA_VERSION checksum verification failed"
-            fi
-        fi
-    fi
-    pause
-}
-
-nvidia_requirements() {
-    clear_screen
-    printf '%sNVIDIA build requirements%s\n\n' "$CYAN$BOLD" "$RESET"
-    printf 'This installs the compiler, DKMS, current kernel headers,\n'
-    printf 'PCI tools, Secure Boot tools, and GLVND development files.\n\n'
-    if confirm 'Install NVIDIA build requirements?'; then
-        if run_cmd sudo apt-get update &&
-            run_cmd sudo apt-get install -y build-essential dkms \
-                "linux-headers-$(uname -r)" pkg-config libglvnd-dev \
-                mokutil pciutils curl ca-certificates; then
-            printf '\n%sBuild requirements installed successfully.%s\n' "$GREEN" "$RESET"
-            nvidia_next 'Select [4] to disable Nouveau and rebuild initramfs.'
-            return
-        else
-            printf '\n%sRequirements failed to install. Do not continue to step 4.%s\n' \
-                "$RED" "$RESET"
-        fi
-    fi
-    pause
-}
-
-nvidia_disable_nouveau() {
-    clear_screen
-    printf '%sPrepare the system for NVIDIA%s\n\n' "$CYAN$BOLD" "$RESET"
-    printf '%sThis step disables the open-source Nouveau driver.%s\n' \
-        "$YELLOW" "$RESET"
-    printf 'It creates /etc/modprobe.d/blacklist-nouveau.conf and rebuilds\n'
-    printf 'the initramfs. A reboot is required afterward.\n\n'
-    printf 'Do not use this step if another GPU depends on Nouveau.\n\n'
-    if confirm 'Disable Nouveau and rebuild initramfs?'; then
-        if ! sudo -v; then
-            printf '%sSudo authentication failed. Nothing was changed.%s\n' \
-                "$RED" "$RESET"
-            pause
-            return
-        fi
-        printf '%s\n' \
-            'blacklist nouveau' \
-            'options nouveau modeset=0' |
-            sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
-        printf '\n'
-        if run_activity 'Rebuilding initramfs' sudo update-initramfs -u; then
-            printf '\n%sSTEP 3 COMPLETE: Nouveau is disabled for the next boot.%s\n' \
-                "$GREEN" "$RESET"
-            log 'Disabled Nouveau and rebuilt initramfs'
-            printf '\n%sA REBOOT IS NOW REQUIRED BEFORE STEP 4.%s\n' \
-                "$YELLOW$BOLD" "$RESET"
-            if confirm 'Reboot the server now?'; then
-                printf 'Rebooting. Reconnect, launch this helper, then select NVIDIA [5].\n'
-                sleep 2
-                sudo reboot
-                return
-            fi
-            nvidia_next 'Exit the helper, run sudo reboot, then select NVIDIA option [5].'
-            return
-        fi
-    fi
-    pause
-}
-
-nvidia_install() {
-    local packages
-    clear_screen
-    printf '%sInstall NVIDIA %s%s\n\n' "$CYAN$BOLD" "$NVIDIA_VERSION" "$RESET"
-
-    if [[ $(uname -m) != x86_64 ]]; then
-        printf '%sInstallation stopped: this package requires x86_64.%s\n' "$RED" "$RESET"
-        pause
-        return
-    fi
-    if [[ ! -f "$NVIDIA_RUN_FILE" ]]; then
-        printf '%sDriver file not found. Use download option 2 first.%s\n' "$RED" "$RESET"
-        nvidia_next 'Select [2] to download and verify the driver.'
-        return
-    fi
-    if ! run_activity 'Verifying NVIDIA download' \
-        nvidia_checksum "$NVIDIA_RUN_FILE"; then
-        printf '%sInstallation stopped: SHA-256 verification failed.%s\n' "$RED" "$RESET"
-        pause
-        return
-    fi
-    if have mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then
-        printf '%sInstallation stopped because Secure Boot is enabled.%s\n' \
-            "$RED" "$RESET"
-        printf 'Disable Secure Boot in firmware, or use Ubuntu signed packages.\n'
-        nvidia_next 'Disable Secure Boot in firmware, then select [5] again.'
-        return
-    fi
-    if lsmod | awk '$1 == "nouveau" { found=1 } END { exit !found }'; then
-        printf '%sInstallation stopped because Nouveau is still loaded.%s\n' \
-            "$RED" "$RESET"
-        printf 'Run option 4, reboot, and try again.\n'
-        nvidia_next 'Select [4], complete it, and reboot before selecting [5] again.'
-        return
-    fi
-    if systemctl is-active --quiet display-manager 2>/dev/null; then
-        printf '%sInstallation stopped: a graphical display manager is active.%s\n' \
-            "$RED" "$RESET"
-        printf 'Stop the graphical session before running the installer.\n'
-        nvidia_next 'Stop the graphical session, then select [5] again.'
-        return
-    fi
-
-    packages=$(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' \
-        'nvidia-driver-*' 2>/dev/null | awk '$1 ~ /^ii/ { print $2 }' || true)
-    if [[ -n "$packages" ]]; then
-        printf '%sUbuntu NVIDIA packages are already present:%s\n%s\n\n' \
-            "$YELLOW" "$RESET" "$packages"
-        printf 'A direct NVIDIA installer can conflict with distribution packages.\n'
-    fi
-    printf '%sThe official NVIDIA installer will modify kernel modules.%s\n' \
-        "$YELLOW" "$RESET"
-    printf 'DKMS will be requested for future kernel-module rebuilds.\n\n'
-    if confirm "Run the NVIDIA ${NVIDIA_VERSION} installer now?"; then
-        chmod 700 -- "$NVIDIA_RUN_FILE"
-        if run_cmd sudo sh "$NVIDIA_RUN_FILE" --dkms; then
-            printf '\n%sSTEP 4 COMPLETE: NVIDIA reports a successful installation.%s\n' \
-                "$GREEN" "$RESET"
-            log "Installed NVIDIA $NVIDIA_VERSION"
-            printf '\n%sA REBOOT IS NOW REQUIRED BEFORE VERIFICATION.%s\n' \
-                "$YELLOW$BOLD" "$RESET"
-            if confirm 'Reboot the server now?'; then
-                printf 'Rebooting. Reconnect, launch this helper, then select NVIDIA [6].\n'
-                sleep 2
-                sudo reboot
-                return
-            fi
-            nvidia_next 'Exit the helper, run sudo reboot, then select NVIDIA option [6].'
-            return
-        else
-            printf '\n%sInstallation failed. Do not reboot merely to continue.%s\n' \
-                "$RED" "$RESET"
-            printf 'Review the error shown above and the current run log.\n'
-        fi
-    fi
-    pause
-}
-
-nvidia_verify() {
-    clear_screen
-    printf '%sVerify NVIDIA driver%s\n\n' "$CYAN$BOLD" "$RESET"
-    if have nvidia-smi; then
-        if run_cmd nvidia-smi; then
-            printf '\n%sSUCCESS: the NVIDIA driver is active and responding.%s\n' \
-                "$GREEN$BOLD" "$RESET"
-        else
-            printf '\n%sVerification failed. The driver is not working correctly.%s\n' \
-                "$RED" "$RESET"
-        fi
-    else
-        printf '%snvidia-smi was not found.%s\n' "$RED" "$RESET"
-    fi
-    printf '\n%sKernel module%s\n' "$YELLOW" "$RESET"
-    if have modinfo && modinfo nvidia >/dev/null 2>&1; then
-        modinfo nvidia | awk '/^(filename|version|vermagic):/ { print }'
-    else
-        printf 'The NVIDIA kernel module is not available.\n'
-    fi
-    printf '\n%sIf nvidia-smi succeeded, the NVIDIA workflow is finished.%s\n' \
-        "$CYAN$BOLD" "$RESET"
-    printf '%sPress Enter to return to the NVIDIA menu...%s' "$WHITE$BOLD" "$RESET"
-    read -r
-}
-
-nvidia_menu() {
-    local choice
-    while true; do
-        show_nvidia_menu
-        printf '%sSelect: %s' "$BOLD" "$RESET"
-        read -r choice
-        case "${choice,,}" in
-            1) nvidia_detect ;;
-            2) nvidia_download ;;
-            3) nvidia_requirements ;;
-            4) nvidia_disable_nouveau ;;
-            5) nvidia_install ;;
-            6) nvidia_verify ;;
             b) return ;;
             *) printf '%sUnknown option.%s\n' "$RED" "$RESET"; sleep 1 ;;
         esac
@@ -834,13 +627,10 @@ qwen_menu() {
         printf '%sSelect: %s' "$BOLD" "$RESET"
         read -r choice
         case "${choice,,}" in
-            1) pull_qwen_model 'qwen3:0.6b' ;;
-            2) pull_qwen_model 'qwen3:1.7b' ;;
-            3) pull_qwen_model 'qwen3:4b' ;;
-            4) pull_qwen_model 'qwen3:8b' ;;
-            5) pull_qwen_model 'qwen3:14b' ;;
-            6) pull_qwen_model 'qwen3:30b-a3b' ;;
-            7) pull_qwen_model 'qwen3.5:27b' ;;
+            1) pull_qwen_model 'qwen2.5-coder:3b' ;;
+            2) pull_qwen_model 'qwen3:0.6b' ;;
+            3) pull_qwen_model 'qwen3:1.7b' ;;
+            4) pull_qwen_model 'qwen3.5:0.8b' ;;
             b) return ;;
             *) printf '%sUnknown option.%s\n' "$RED" "$RESET"; sleep 1 ;;
         esac
@@ -891,13 +681,13 @@ hardware_overview() {
         run_cmd fastfetch
     else
         printf '%sCPU%s\n' "$YELLOW" "$RESET"
-        lscpu | sed -n '1,22p'
+        run_cmd lscpu
         printf '\n%sMemory%s\n' "$YELLOW" "$RESET"
-        free -h
+        run_cmd free -h
         printf '\n%sStorage%s\n' "$YELLOW" "$RESET"
-        lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+        run_cmd lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
         printf '\n%sDisk usage%s\n' "$YELLOW" "$RESET"
-        df -hT -x tmpfs -x devtmpfs
+        run_cmd df -hT -x tmpfs -x devtmpfs
     fi
     log 'Displayed hardware overview'
     pause
@@ -924,8 +714,12 @@ kernel_errors() {
     pause
 }
 
+scan_storage() {
+    sudo -n smartctl --scan-open > "$1"
+}
+
 storage_health() {
-    local device found=0
+    local device found=0 scan_file
     clear_screen
     printf '%sStorage health%s\n\n' "$CYAN$BOLD" "$RESET"
     if ! have smartctl; then
@@ -934,12 +728,16 @@ storage_health() {
         pause
         return
     fi
+    scan_file=$(mktemp) || return 1
+    sudo -v || { rm -f -- "$scan_file"; pause; return 1; }
+    run_activity 'Scanning storage' scan_storage "$scan_file"
     while read -r device _; do
         [[ -n "$device" ]] || continue
         found=1
         printf '\n%s--- %s ---%s\n' "$YELLOW" "$device" "$RESET"
         run_cmd sudo smartctl -H "$device" || true
-    done < <(sudo smartctl --scan-open 2>/dev/null)
+    done < "$scan_file"
+    rm -f -- "$scan_file"
     (( found == 0 )) && printf 'No SMART-compatible storage device was detected.\n'
     pause
 }
@@ -960,14 +758,14 @@ network_status() {
     clear_screen
     printf '%sNetwork status%s\n\n' "$CYAN$BOLD" "$RESET"
     printf '%sInterfaces%s\n' "$YELLOW" "$RESET"
-    ip -brief address
+    run_cmd ip -brief address
     printf '\n%sRoutes%s\n' "$YELLOW" "$RESET"
-    ip route
+    run_cmd ip route
     printf '\n%sDNS%s\n' "$YELLOW" "$RESET"
     if have resolvectl; then
-        resolvectl status
+        run_cmd resolvectl status
     else
-        sed -n '1,120p' /etc/resolv.conf
+        run_cmd sed -n '1,120p' /etc/resolv.conf
     fi
     log 'Displayed network status'
     pause
@@ -989,12 +787,12 @@ full_report() {
     local report_dir report
     report_dir="$HOME/ubuntu-check-reports"
     mkdir -p -- "$report_dir"
-    report="$report_dir/report-$(date '+%Y%m%d-%H%M%S').txt"
+    report=$(mktemp "$report_dir/report-$(date '+%Y%m%d-%H%M%S')-XXXXXX.txt") || return 1
     clear_screen
     printf '%sFull system report%s\n\n' "$CYAN$BOLD" "$RESET"
     sudo -v || { printf '%sSudo authentication failed.%s\n' "$RED" "$RESET"; pause; return; }
 
-    {
+    collect_report() {
         printf 'UBUNTU SERVER CHECK REPORT\n'
         printf 'Generated: %s\n\n' "$(date --iso-8601=seconds)"
         printf '===== OPERATING SYSTEM =====\n'
@@ -1014,7 +812,7 @@ full_report() {
         printf '\n===== CURRENT BOOT ERRORS =====\n'
         journalctl -b -p err --no-pager
         printf '\n===== KERNEL ERRORS =====\n'
-        sudo dmesg --level=emerg,alert,crit,err --ctime
+        sudo -n dmesg --level=emerg,alert,crit,err --ctime
         printf '\n===== NETWORK =====\n'
         ip -brief address
         ip route
@@ -1030,7 +828,9 @@ full_report() {
             printf '\n===== USB DEVICES =====\n'
             lsusb
         fi
-    } > "$report" 2>&1
+    }
+    write_report() { collect_report > "$report" 2>&1; }
+    run_activity 'Creating system report' write_report
 
     log "Created system report: $report"
     printf '%sReport created:%s\n%s\n' "$GREEN" "$RESET" "$report"
@@ -1103,7 +903,7 @@ main() {
         case "${choice,,}" in
             1) update_ubuntu ;;
             2) utilities_menu ;;
-            3) nvidia_menu ;;
+            3) network_menu ;;
             4) ai_menu ;;
             5) checks_menu ;;
             l) view_log ;;
@@ -1118,4 +918,7 @@ main() {
     done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
+
